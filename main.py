@@ -1,15 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import math
+import re
 
 app = FastAPI(
     title="EngineerMind AI - Physics & Diagnostics Engine",
     description="Deterministic calculation and rule verification engine for external CFD",
-    version="1.0.0"
+    version="1.1.0"
 )
 
-# Enable CORS so your future frontend can communicate with this API
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input data contract: user provides 4 core physical parameters
 class CaseInput(BaseModel):
     velocity: float              # Freestream velocity (m/s)
     chord_length: float          # Characteristic length / chord (meters)
@@ -26,7 +26,6 @@ class CaseInput(BaseModel):
     viscosity: float = 1.789e-5  # Dynamic viscosity of air (Pa.s)
     target_y_plus: float = 1.0   # Boundary layer resolution target
 
-# Output data contract: deterministic physics returned to HUD
 class PhysicsOutput(BaseModel):
     reynolds_number: float
     mach_number: float
@@ -41,27 +40,31 @@ class PhysicsOutput(BaseModel):
     recommended_spatial_discretization: str
     senior_engineer_rationale: str
 
+class DiagnosticReport(BaseModel):
+    total_iterations: int
+    final_continuity: float
+    final_drag: float
+    drag_std_dev: float
+    is_converged: bool
+    diagnostic_flag: str
+    senior_engineer_review: str
+
 @app.get("/")
 def health_check():
     return {"status": "EngineerMind AI Physics Engine is active"}
 
 @app.post("/calculate-physics", response_model=PhysicsOutput)
 def calculate_physics(data: CaseInput):
-    # Safety guardrails: avoid negative or zero physical inputs
     if data.velocity <= 0 or data.chord_length <= 0:
         raise HTTPException(
             status_code=400, 
             detail="Velocity and chord length must be strictly positive numbers."
         )
 
-    # 1. Calculate Reynolds Number: Re = (rho * v * L) / mu
+    # 1. Non-dimensional quantities
     re = (data.fluid_density * data.velocity * data.chord_length) / data.viscosity
+    mach = data.velocity / 340.3
 
-    # 2. Calculate Mach Number: Ma = v / speed_of_sound (340.3 m/s at 288.15 K)
-    speed_of_sound = 340.3
-    mach = data.velocity / speed_of_sound
-
-    # Determine flow regime
     if mach >= 0.3:
         regime = "Compressible Subsonic (Density variations must be modeled)"
     elif re < 5e5:
@@ -69,27 +72,23 @@ def calculate_physics(data: CaseInput):
     else:
         regime = "Incompressible Fully Turbulent"
 
-    # 3. Boundary Layer Thickness (Flat Plate Estimate): delta = 0.37 * c / (Re^0.2)
+    # 2. Boundary Layer Thickness (Flat Plate Estimate)
     delta_meters = (0.37 * data.chord_length) / (re ** 0.2)
     delta_mm = delta_meters * 1000.0
 
-    # 4. First Cell Height Calculation (delta_s for target y+)
-    # Skin friction coefficient: Cf = 0.0583 * Re^(-0.2)
+    # 3. First Cell Height Calculation (delta_s for target y+)
     cf = 0.0583 * (re ** -0.2)
-    # Wall shear stress: tau_w = 0.5 * rho * v^2 * Cf
     tau_w = 0.5 * data.fluid_density * (data.velocity ** 2) * cf
-    # Friction velocity: u_tau = sqrt(tau_w / rho)
     u_tau = math.sqrt(tau_w / data.fluid_density)
-    # First cell height: delta_s = (y_plus * mu) / (rho * u_tau)
     delta_s_meters = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
     delta_s_mm = delta_s_meters * 1000.0
 
-    # 5. Domain Dimensions (15c upstream, 25c wake, 15c farfield)
+    # 4. Domain Sizing
     inlet = data.chord_length * 15.0
     outlet = data.chord_length * 25.0
     lateral = data.chord_length * 15.0
 
-    # 6. Prescribed Model & Senior Engineer Rationale
+    # 5. Model Guidance & Senior Engineer Explanations
     rec_model = "k-omega SST (Menter)"
     rec_coupling = "Coupled (Pressure-Velocity)"
     rec_schemes = "Second-Order Upwind (Momentum & Turbulent Quantities)"
@@ -113,19 +112,6 @@ def calculate_physics(data: CaseInput):
         recommended_spatial_discretization=rec_schemes,
         senior_engineer_rationale=rationale
     )
-from fastapi import UploadFile, File
-import re
-import csv
-import io
-
-class DiagnosticReport(BaseModel):
-    total_iterations: int
-    final_continuity: float
-    final_drag: float
-    drag_std_dev: float
-    is_converged: bool
-    diagnostic_flag: str
-    senior_engineer_review: str
 
 @app.post("/api/diagnostics/parse-log", response_model=DiagnosticReport)
 async def parse_simulation_log(file: UploadFile = File(...)):
@@ -137,26 +123,21 @@ async def parse_simulation_log(file: UploadFile = File(...)):
     cd_vals = []
     iterations = 0
 
-    # Parse CSV or standard console log format (iteration, continuity, cl, cd)
     for line in lines:
         line_clean = line.strip()
         if not line_clean or line_clean.startswith("#") or line_clean.startswith("iter"):
             continue
         
-        # Check comma-separated format
         parts = [p.strip() for p in re.split(r'[\s,]+', line_clean) if p.strip()]
         if len(parts) >= 2:
             try:
-                # Iteration counter
                 iter_num = int(parts[0])
                 iterations = max(iterations, iter_num)
-                
-                # Check for floating values
                 vals = [float(p) for p in parts[1:] if re.match(r'^-?\d+(\.\d+)?([eE][-+]?\d+)?$', p)]
                 if len(vals) >= 1:
                     continuity_vals.append(vals[0])
                 if len(vals) >= 3:
-                    cd_vals.append(vals[2]) # Typically iteration, continuity, cl, cd
+                    cd_vals.append(vals[2])
                 elif len(vals) >= 2:
                     cd_vals.append(vals[1])
             except ValueError:
@@ -165,17 +146,14 @@ async def parse_simulation_log(file: UploadFile = File(...)):
     if iterations == 0:
         iterations = len(continuity_vals) if continuity_vals else 500
 
-    # Default fallback metrics if specific columns are missing in uploaded snippet
     final_cont = continuity_vals[-1] if continuity_vals else 8.4e-6
     final_cd = cd_vals[-1] if cd_vals else 0.00845
 
-    # Compute rolling standard deviation on final 50 drag points
     sample_cd = cd_vals[-50:] if len(cd_vals) >= 50 else (cd_vals if cd_vals else [final_cd])
     mean_cd = sum(sample_cd) / len(sample_cd)
     variance = sum((x - mean_cd) ** 2 for x in sample_cd) / len(sample_cd)
     drag_std = math.sqrt(variance)
 
-    # Deterministic validation rules
     if final_cont <= 1e-4 and drag_std < 1e-4:
         is_conv = True
         flag = "PASSED: True Asymptotic Convergence"
