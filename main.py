@@ -7,7 +7,7 @@ import re
 app = FastAPI(
     title="EngineerMind AI - Physics & Diagnostics Core",
     description="Deterministic boundary layer fluid dynamics and CAE diagnostic verification engine",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 app.add_middleware(
@@ -19,12 +19,12 @@ app.add_middleware(
 )
 
 class CaseInput(BaseModel):
-    velocity: float              # Freestream velocity U_inf (m/s)
-    chord_length: float          # Characteristic chord c (meters)
-    fluid_density: float = 1.225 # Air density at standard sea level (kg/m^3)
-    viscosity: float = 1.789e-5  # Dynamic viscosity mu (Pa.s)
-    target_y_plus: float = 1.0   # Wall boundary layer target resolution
-    turbulence_model: str = "k-omega SST" # Selected model
+    velocity: float
+    chord_length: float
+    fluid_density: float = 1.225
+    viscosity: float = 1.789e-5
+    target_y_plus: float = 1.0
+    regime: str = "external_aerodynamics" # or "internal_nozzle"
 
 class PhysicsOutput(BaseModel):
     reynolds_number: float
@@ -56,84 +56,69 @@ class DiagnosticReport(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "EngineerMind AI Physics Core is active and operational"}
+    return {"status": "EngineerMind AI Physics Core is active"}
 
 @app.post("/calculate-physics", response_model=PhysicsOutput)
 def calculate_physics(data: CaseInput):
     if data.velocity <= 0 or data.chord_length <= 0:
         raise HTTPException(
             status_code=400, 
-            detail="Velocity and chord length must be strictly positive numerical values."
+            detail="Velocity and chord length must be strictly positive."
         )
 
-    # 1. Non-dimensional parameter evaluation
     re = (data.fluid_density * data.velocity * data.chord_length) / data.viscosity
     mach = data.velocity / 340.3
 
-    if mach >= 0.3:
-        regime = "Compressible Subsonic (Compressibility & variable density modeling mandatory)"
-    elif re < 5e5:
-        regime = "Incompressible Laminar / Transitional Flow"
+    if data.regime == "internal_nozzle":
+        cf = 0.079 * (re ** -0.25) # Blasius / Moody internal correlation
+        tau_w = 0.5 * data.fluid_density * (data.velocity ** 2) * cf
+        u_tau = math.sqrt(tau_w / data.fluid_density)
+        delta_s_m = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
+        delta_m = 0.5 * data.chord_length
+        inlet = data.chord_length * 5.0
+        outlet = data.chord_length * 8.0
+        lateral = data.chord_length * 2.5
+        regime_desc = "Internal Compressible Flow (CD Nozzle / Duct)"
     else:
-        regime = "Incompressible Fully Turbulent Flow"
+        cf = 0.0583 * (re ** -0.2) # Schlichting flat-plate correlation
+        tau_w = 0.5 * data.fluid_density * (data.velocity ** 2) * cf
+        u_tau = math.sqrt(tau_w / data.fluid_density)
+        delta_s_m = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
+        delta_m = (0.37 * data.chord_length) / (re ** 0.2)
+        inlet = data.chord_length * 15.0
+        outlet = data.chord_length * 25.0
+        lateral = data.chord_length * 15.0
+        regime_desc = "Incompressible Fully Turbulent Flow" if mach < 0.3 else "Compressible Subsonic Flow"
 
-    # 2. Turbulent Skin Friction & Shear Stress Formulations (Schlichting / Prandtl)
-    cf = 0.0583 * (re ** -0.2)
-    tau_w = 0.5 * data.fluid_density * (data.velocity ** 2) * cf
-    u_tau = math.sqrt(tau_w / data.fluid_density)
-
-    # 3. First Cell Height Calculation (Delta s) based on target y+
-    delta_s_m = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
     delta_s_mm = delta_s_m * 1000.0
-
-    # 4. Total Boundary Layer Thickness (Flat Plate Boundary Layer)
-    delta_m = (0.37 * data.chord_length) / (re ** 0.2)
     delta_mm = delta_m * 1000.0
 
-    # 5. Inflation Layer Distribution (Geometric Progression)
-    growth_rate = 1.15
-    prism_thickness = delta_m * 0.40 # Resolve at least 40% of inner boundary layer with prisms
-    try:
-        layers = int(math.ceil(math.log(1.0 + (prism_thickness / delta_s_m) * (growth_rate - 1.0)) / math.log(growth_rate)))
-        layers = max(18, min(layers, 35))
-    except Exception:
-        layers = 28
+    layers = 28 if data.target_y_plus <= 1.0 else 12
 
-    # 6. Rationale grounded in wall resolution physics
-    if data.target_y_plus <= 1.0:
-        wall_rationale = (
-            f"Wall-Resolved formulation (y+ = {data.target_y_plus:.1f}): Near-wall viscous sublayer (y+ < 5) "
-            "is directly discretized without semi-empirical wall functions. Required for k-omega SST to resolve "
-            "adverse pressure gradients, separation bubbles, and aerodynamic stall."
-        )
-    else:
-        wall_rationale = (
-            f"Wall-Function formulation (y+ = {data.target_y_plus:.1f}): First computational node is placed in the "
-            "fully turbulent log-law region (30 < y+ < 300). Near-wall shear stresses are estimated empirically, "
-            "significantly reducing cell count at the cost of separation prediction fidelity."
-        )
-
-    # 7. Virtual Wind Tunnel Domain Boundaries
-    inlet = data.chord_length * 15.0
-    outlet = data.chord_length * 25.0
-    lateral = data.chord_length * 15.0
+    rationale = (
+        f"Wall-Resolved formulation (y+ = {data.target_y_plus:.1f}): Near-wall viscous sublayer "
+        "is resolved without empirical wall functions. Required for SST k-omega to predict separation."
+        if data.target_y_plus <= 1.0 else
+        f"Wall-Function formulation (y+ = {data.target_y_plus:.1f}): First node placed in log-law layer "
+        "(30 < y+ < 300), reducing cell count for high-Re attached flows."
+    )
 
     return PhysicsOutput(
         reynolds_number=round(re, 2),
         mach_number=round(mach, 3),
-        flow_regime=regime,
+        flow_regime=regime_desc,
         boundary_layer_thickness_mm=round(delta_mm, 2),
         skin_friction_coeff=float(f"{cf:.6f}"),
         wall_shear_stress_pa=round(tau_w, 3),
         friction_velocity_ms=round(u_tau, 3),
         first_cell_height_mm=round(delta_s_mm, 5),
         recommended_prism_layers=layers,
-        recommended_growth_rate=growth_rate,
+        recommended_growth_rate=1.15,
         inlet_distance_m=round(inlet, 2),
         outlet_distance_m=round(outlet, 2),
         lateral_distance_m=round(lateral, 2),
         recommended_turbulence_model="k-omega SST (Menter)",
-        wall_treatment_rationale=wall_rationale,
+        wall_treatment_rationale=rationale,
         recommended_coupling="Coupled (Pseudo Transient)",
         recommended_spatial_discretization="Second-Order Upwind"
     )
@@ -144,8 +129,7 @@ async def parse_simulation_log(file: UploadFile = File(...)):
     text = contents.decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
-    continuity_vals = []
-    cd_vals = []
+    continuity_vals, cd_vals = [], []
     iterations = 0
 
     for line in lines:
@@ -155,21 +139,15 @@ async def parse_simulation_log(file: UploadFile = File(...)):
         parts = [p.strip() for p in re.split(r'[\s,]+', line_clean) if p.strip()]
         if len(parts) >= 2:
             try:
-                iter_num = int(parts[0])
-                iterations = max(iterations, iter_num)
+                iterations = max(iterations, int(parts[0]))
                 vals = [float(p) for p in parts[1:] if re.match(r'^-?\d+(\.\d+)?([eE][-+]?\d+)?$', p)]
-                if len(vals) >= 1:
-                    continuity_vals.append(vals[0])
-                if len(vals) >= 3:
-                    cd_vals.append(vals[2])
-                elif len(vals) >= 2:
-                    cd_vals.append(vals[1])
+                if len(vals) >= 1: continuity_vals.append(vals[0])
+                if len(vals) >= 3: cd_vals.append(vals[2])
+                elif len(vals) >= 2: cd_vals.append(vals[1])
             except ValueError:
                 continue
 
-    if iterations == 0:
-        iterations = len(continuity_vals) if continuity_vals else 500
-
+    if iterations == 0: iterations = len(continuity_vals) if continuity_vals else 500
     final_cont = continuity_vals[-1] if continuity_vals else 8.4e-6
     final_cd = cd_vals[-1] if cd_vals else 0.00845
 
@@ -182,25 +160,20 @@ async def parse_simulation_log(file: UploadFile = File(...)):
         is_conv = True
         flag = "PASSED: True Asymptotic Convergence"
         review = (
-            f"Continuity residuals achieved monotonic convergence ({final_cont:.2e}), and force monitors "
-            f"demonstrate asymptotic stability with rolling standard deviation σ = {drag_std:.6f}. "
-            "Solution satisfies ASME V&V 20 criteria for steady-state verification."
+            f"Residuals converged below 1e-5 ({final_cont:.2e}), and monitors "
+            f"exhibit asymptotic stability with rolling standard deviation σ = {drag_std:.6f}."
         )
     elif final_cont <= 1e-4 and drag_std >= 1e-4:
         is_conv = False
         flag = "ANOMALY: Residual Convergence with Force Oscillation"
         review = (
-            f"Residuals met mathematical convergence limits ({final_cont:.2e}), but drag coefficient fluctuates "
-            f"(σ = {drag_std:.6f}). This signals physical unsteadiness (suction surface vortex shedding). "
-            "Steady-state RANS is unphysical; transition to Transient formulation (URANS / pimpleFoam)."
+            f"Residuals achieved mathematical limits ({final_cont:.2e}), but surface monitors fluctuate "
+            f"(σ = {drag_std:.6f}). Physical unsteadiness (vortex shedding) detected. Steady RANS is unphysical; switch to Transient."
         )
     else:
         is_conv = False
         flag = "STALLED: Incomplete Residual Decay"
-        review = (
-            f"Continuity residual stalled prematurely at {final_cont:.2e}. The solver stopped before reaching "
-            "the 1e-5 threshold. Inspect boundary layer prism cell aspect ratios or relax under-relaxation factors."
-        )
+        review = f"Continuity residual stalled at {final_cont:.2e}. Inspect prism aspect ratios or relax under-relaxation factors."
 
     return DiagnosticReport(
         total_iterations=iterations,
