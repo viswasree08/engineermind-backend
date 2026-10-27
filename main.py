@@ -7,7 +7,7 @@ import re
 app = FastAPI(
     title="EngineerMind AI - Physics & Diagnostics Core",
     description="Deterministic boundary layer fluid dynamics, analytical hand calculations, and CAE diagnostic verification",
-    version="1.6.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -68,21 +68,21 @@ class DiagnosticReport(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "EngineerMind AI Physics & Hand-Calculation Core is live"}
+    return {"status": "EngineerMind AI Physics Core is active"}
 
 @app.post("/calculate-physics", response_model=PhysicsOutput)
 def calculate_physics(data: CaseInput):
     if data.velocity <= 0 or data.chord_length <= 0:
-        raise HTTPException(status_code=400, detail="Velocity and chord length must be strictly positive.")
+        raise HTTPException(status_code=400, detail="Velocity and chord length must be strictly positive numerical values.")
 
-    # 1. Non-dimensional Fluid Mechanics
+    # 1. Non-dimensional Fluid Mechanics Formulations
     re = (data.fluid_density * data.velocity * data.chord_length) / data.viscosity
     mach = data.velocity / 340.3
     q = 0.5 * data.fluid_density * (data.velocity ** 2)
 
-    # 2. Analytical Hand-Calculation Formulations (Schlichting & Prandtl)
+    # 2. Analytical Hand Calculations (Schlichting & Prandtl correlations)
     if data.regime == "internal_nozzle":
-        cf = 0.079 * (re ** -0.25)
+        cf = 0.079 * (re ** -0.25) # Blasius / Moody internal correlation
         tau_w = q * cf
         u_tau = math.sqrt(tau_w / data.fluid_density)
         delta_s_m = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
@@ -90,25 +90,25 @@ def calculate_physics(data: CaseInput):
         f_drag = 2.0 * q * data.chord_length * cf
         cl_slope = 0.0
         cl_4deg = 0.0
-        cd0_str = f"{cf:.5f} (Pipe Friction Factor)"
+        cd0_str = f"{cf:.5f} (Internal Pipe Friction Factor)"
         inlet = data.chord_length * 5.0
         outlet = data.chord_length * 8.0
         lateral = data.chord_length * 2.5
         regime_desc = "Internal Compressible Flow"
     else:
-        cf = 0.0583 * (re ** -0.2)
+        cf = 0.0583 * (re ** -0.2) # Schlichting turbulent correlation
         tau_w = q * cf
         u_tau = math.sqrt(tau_w / data.fluid_density)
         delta_s_m = (data.target_y_plus * data.viscosity) / (data.fluid_density * u_tau)
         delta_m = (0.37 * data.chord_length) / (re ** 0.2)
-        f_drag = 2.0 * q * data.chord_length * cf # 2 sides of aerofoil
+        f_drag = 2.0 * q * data.chord_length * cf # 2 wetted surfaces of aerofoil
         cl_slope = 0.11 # Thin airfoil theory: 2*pi per rad ≈ 0.11 per degree
         cl_4deg = cl_slope * 4.0
-        cd0_str = f"0.0060 - 0.0085 (Typical Aerofoil Cd0)"
+        cd0_str = "0.0060 - 0.0085 (Typical Aerofoil Parasite Cd0)"
         inlet = data.chord_length * 15.0
         outlet = data.chord_length * 25.0
         lateral = data.chord_length * 15.0
-        regime_desc = "Incompressible Turbulent Flow" if mach < 0.3 else "Compressible Subsonic Flow"
+        regime_desc = "Incompressible Fully Turbulent Flow" if mach < 0.3 else "Compressible Subsonic Flow"
 
     delta_s_mm = delta_s_m * 1000.0
     delta_mm = delta_m * 1000.0
@@ -191,15 +191,15 @@ async def parse_simulation_log(file: UploadFile = File(...)):
     if final_cont <= 1e-4 and drag_std < 1e-4:
         is_conv = True
         flag = "PASSED: True Asymptotic Convergence"
-        review = f"Residuals converged below 1e-5 ({final_cont:.2e}) with force monitor stability (σ = {drag_std:.6f})."
+        review = f"Continuity residuals achieved monotonic decay ({final_cont:.2e}), and force monitors demonstrate stability with rolling standard deviation σ = {drag_std:.6f}."
     elif final_cont <= 1e-4 and drag_std >= 1e-4:
         is_conv = False
         flag = "ANOMALY: Residual Convergence with Force Oscillation"
-        review = f"Residuals met criteria ({final_cont:.2e}), but surface force monitors fluctuate (σ = {drag_std:.6f}). Physical unsteadiness (vortex shedding) detected. Steady RANS is unphysical; switch to Transient."
+        review = f"Residuals met numerical criteria ({final_cont:.2e}), but surface force monitors oscillate (σ = {drag_std:.6f}). Physical unsteadiness (vortex shedding) detected. Steady RANS is unphysical; transition to Transient."
     else:
         is_conv = False
         flag = "STALLED: Incomplete Residual Decay"
-        review = f"Continuity residual stalled at {final_cont:.2e}. Inspect prism aspect ratios or relax under-relaxation factors."
+        review = f"Continuity residual stalled at {final_cont:.2e}. The solver stopped prematurely before reaching the 1e-5 threshold. Inspect prism aspect ratios or relax under-relaxation factors."
 
     return DiagnosticReport(
         total_iterations=iterations,
